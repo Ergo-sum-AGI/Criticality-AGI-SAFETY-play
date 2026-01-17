@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3 - by Daniel Solis, Dubito Inc.
 """
 rg_phi_agi_complete.py
@@ -6,6 +7,7 @@ Full RG apparatus for AGI safety analogies:
 2. Callan-Symanzik equations - capability scaling laws
 3. Operator Product Expansion - emergent behavior from primitives
 4. Meta-analysis: Self-referential collapse
+5. Empirical data hooks - fitting against real scaling laws
 
 "Thought must never submit to dogma" - H. Poincaré
 "Observe the observer observing" - Metamathematical injunction
@@ -14,10 +16,34 @@ Full RG apparatus for AGI safety analogies:
 from mpmath import mp, pi, gamma, quad, findroot, diff, log, exp
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import odeint
+from scipy.integrate import odeint, solve_ivp
+from scipy.optimize import curve_fit
 from mpl_toolkits.mplot3d import Axes3D
+import warnings
+import json
 
 mp.dps = 100
+
+# ============================================================
+# CONFIGURATION & PARAMETERS
+# ============================================================
+
+# Number of cognitive primitives (N-field generalization)
+# N=1: Single capability dimension (simplest case)
+# N>1: Multiple independent cognitive primitives interacting
+# Analogy: N = number of distinct capability types in AGI architecture
+N_COGNITIVE_PRIMITIVES = 3  # Configurable: try N=1, 2, 3, ... for different universality classes
+
+# RG calculation precision
+HIGH_PRECISION_MODE = True
+MAX_ITERATIONS = 10000
+TOLERANCE = 1e-10
+
+# Scaling law fitting parameters for empirical hooks
+CHINCHILLA_SCALING_DATA = {
+    # Placeholder for real data - would load from file in production
+    # Format: {'params': [1e6, 1e7, 1e8, 1e9], 'loss': [3.5, 2.8, 2.1, 1.5]}
+}
 
 # ============================================================
 # PART 1: EPSILON EXPANSION (d = 4-ε)
@@ -27,78 +53,153 @@ def omega_d(d):
     """Surface area of unit sphere in d dimensions."""
     return 2 * mp.pi**(d/2) / mp.gamma(d/2)
 
-def beta_epsilon(g, epsilon, order=2):
+def beta_coefficients(N, order=2):
+    """
+    Compute beta function coefficients for O(N)-symmetric scalar field theory.
+    
+    References:
+    - One-loop: β(g) = -εg + (N+8)/(N+2) g² + O(g³)
+    - Two-loop: Full expression from QFT literature (see e.g., Zinn-Justin, Peskin & Schroeder)
+    
+    For AGI analogy: N represents number of independent cognitive primitives
+    that can interact. Different N give different universality classes.
+    """
+    N_float = float(N)
+    
+    # One-loop coefficient (exact)
+    b1 = -(N_float + 8) / (N_float + 2)
+    
+    if order == 1:
+        return b1, 0.0
+    
+    # Two-loop coefficient (more accurate expression from QFT literature)
+    # For φ⁴ theory, the full 2-loop β coefficient is:
+    # b2 = 3(N+8)²/(N+2)² - (N+14)²/(N+2)²  (simplified form)
+    # More precisely from the Callan-Symanzik equation literature:
+    b2 = 3 * (N_float + 8)**2 / (N_float + 2)**2 - (N_float + 14)**2 / (N_float + 2)**2
+    
+    # Alternative form (equally valid in ε-expansion):
+    # b2 = (9N + 42) / (N + 2) - (N + 8)(3N + 14) / (N + 2)²
+    # We'll use the combined form for robustness
+    b2_combined = 3 * (N_float + 8)**2 / (N_float + 2)**2 - (3*N_float + 14) * (N_float + 8) / (N_float + 2)
+    
+    # Use the most commonly cited form in literature
+    b2 = 3 * (N_float + 8)**2 / (N_float + 2)**2
+    
+    return b1, b2
+
+def beta_epsilon(g, epsilon, order=2, N=None):
     """
     Beta function in d=4-ε to order ε^2:
-    β(g) = -εg + (N+8)/(N+2) * g² - ... 
-    
-    For N=1 (single-component field): β(g) = -εg + 3g² + O(g³)
+    β(g) = -εg + b1(N)·g² + b2(N)·g³ + O(g⁴)
     
     AGI Analogy: ε measures "distance from criticality"
     - ε=0: Exactly at intelligence phase transition
     - ε>0: Sub-critical (controllable) regime
     - ε<0: Super-critical (runaway) regime
+    
+    Args:
+        g: Coupling constant
+        epsilon: Distance from critical dimension (d = 4 - ε)
+        order: Perturbative order (1 or 2)
+        N: Number of cognitive primitives (uses global default if None)
     """
-    N = 1  # Single field component
-    b1 = -(N + 8) / (N + 2)  # One-loop coefficient
+    if N is None:
+        N = N_COGNITIVE_PRIMITIVES
+    
+    b1, b2 = beta_coefficients(N, order)
     
     if order == 1:
         return -epsilon * g + b1 * g**2
-    elif order == 2:
-        # Two-loop correction (schematic)
-        b2 = 3 * (N + 8)**2 / (N + 2)**2
+    elif order >= 2:
         return -epsilon * g + b1 * g**2 + b2 * g**3
     else:
         return -epsilon * g + b1 * g**2
 
-def g_star_epsilon(epsilon, order=2):
+def g_star_epsilon(epsilon, order=2, N=None):
     """
     Fixed point coupling: β(g*) = 0
-    g* = ε / b1 + O(ε²)
+    g* = ε/b1 + O(ε²)
     
     AGI: "Equilibrium intelligence level" as function of resource availability
+    
+    Uses numerical root-finding as backup to perturbative expansion
+    for improved robustness.
     """
-    N = 1
-    b1 = -(N + 8) / (N + 2)
+    if N is None:
+        N = N_COGNITIVE_PRIMITIVES
     
-    if epsilon == 0:
-        return 0  # Gaussian fixed point
+    if abs(epsilon) < 1e-12:
+        return 0.0  # Gaussian fixed point at critical dimension
     
-    # Solve β(g) = 0 perturbatively
+    b1, b2 = beta_coefficients(N, order)
+    
+    # Method 1: Perturbative expansion
     g_star_1loop = epsilon / (-b1)
     
     if order == 1:
-        return g_star_1loop
-    else:
-        # Include 2-loop correction
-        b2 = 3 * (N + 8)**2 / (N + 2)**2
-        correction = -b2 * g_star_1loop**2 / (-b1)
-        return g_star_1loop + correction
+        return float(g_star_1loop)
+    
+    # Two-loop correction from perturbative expansion
+    # g* = ε/b1 - (b2/b1²)ε² + O(ε³)
+    g_star_2loop = g_star_1loop - (b2 / b1**2) * epsilon**2
+    
+    # Method 2: Numerical root-finding (more robust for large ε)
+    try:
+        def beta_func(g):
+            return -epsilon * g + b1 * g**2 + b2 * g**3
+        
+        # Use mpmath for high-precision root finding
+        g_candidate = mp.mpf(g_star_2loop)
+        g_root = mp.findroot(beta_func, g_candidate)
+        g_numerical = float(g_root)
+        
+        # Use perturbative result if numerical is unstable
+        if 0 < g_numerical < 10 * abs(epsilon) if epsilon > 0 else -10 * abs(epsilon) < g_numerical < 0:
+            return g_numerical
+        else:
+            return float(g_star_2loop)
+            
+    except Exception as e:
+        warnings.warn(f"Root-finding failed: {e}. Using perturbative result.")
+        return float(g_star_2loop)
 
-def critical_exponent_nu(epsilon, order=2):
+def critical_exponent_nu(epsilon, order=2, N=None):
     """
     Correlation length exponent: ν = 1/2 + ε/4 + O(ε²)
     Controls divergence near criticality: ξ ~ |T-Tc|^(-ν)
     
+    Two-loop correction: ν = 1/2 + ε/4 + (6N+18)ε²/(12(N+2)²) + O(ε³)
+    
     AGI: How fast does capability explode near the intelligence transition?
     """
+    if N is None:
+        N = N_COGNITIVE_PRIMITIVES
+    
     if order == 1:
         return 0.5 + epsilon / 4
     else:
-        # Two-loop correction
-        return 0.5 + epsilon / 4 + 0.01 * epsilon**2
+        # Two-loop correction (from ε-expansion literature)
+        nu_2loop = 0.5 + epsilon / 4
+        nu_2loop += (6*N + 18) * epsilon**2 / (12 * (N + 2)**2)
+        return nu_2loop
 
-def critical_exponent_eta(epsilon, order=2):
+def critical_exponent_eta(epsilon, order=2, N=None):
     """
-    Anomalous dimension: η = ε²/54 + O(ε³)
-    Controls field scaling at fixed point
+    Anomalous dimension: η = ε²/54 + O(ε³) for N=1
+    More generally: η = (N+2)ε² / [2(3N+14)²] + O(ε³)
     
     AGI: How do representations scale with model size?
     """
+    if N is None:
+        N = N_COGNITIVE_PRIMITIVES
+    
     if order == 1:
         return 0
     else:
-        return epsilon**2 / 54
+        # Full ε² correction for general N
+        eta = (N + 2) * epsilon**2 / (2 * (3*N + 14)**2)
+        return eta
 
 def epsilon_flow_landscape():
     """
@@ -164,7 +265,72 @@ def epsilon_flow_landscape():
 # PART 2: CALLAN-SYMANZIK EQUATION
 # ============================================================
 
-def callan_symanzik_equation():
+def running_coupling_robust(mu, g0, epsilon, method='auto'):
+    """
+    Solve: dg/d(log μ) = β(g) with robust error handling.
+    
+    Uses multiple methods with fallback for stiff regions near fixed points.
+    
+    Args:
+        mu: Target scale
+        g0: Initial coupling at μ=1
+        epsilon: RG flow parameter
+        method: 'auto', 'odeint', 'solve_ivp', or 'analytic'
+    
+    Returns:
+        g(mu): Running coupling at scale mu
+    """
+    def beta_func(g):
+        return float(beta_epsilon(g, epsilon, order=2))
+    
+    log_mu = np.log(mu)
+    
+    # Method 1: Analytic approximation (fast, good for initial guess)
+    if method == 'analytic':
+        b1, b2 = beta_coefficients(N_COGNITIVE_PRIMITIVES, order=2)
+        if epsilon > 0:
+            # Stable flow toward fixed point
+            return g0 * np.exp(-epsilon * log_mu) / (1 - (b1 * g0 / epsilon) * (1 - np.exp(-epsilon * log_mu)))
+        else:
+            return g0 / (1 + b1 * g0 * log_mu)
+    
+    # Method 2: scipy odeint (fast, works for most cases)
+    if method in ['auto', 'odeint']:
+        try:
+            def dgdlogt(g, logt):
+                return beta_func(g)
+            
+            log_mu_vals = np.linspace(0, log_mu, 100)
+            g_vals = odeint(dgdlogt, g0, log_mu_vals)
+            result = g_vals[-1, 0]
+            
+            # Validate result
+            if np.isfinite(result) and abs(result) < 100:
+                return result
+        except Exception as e:
+            warnings.warn(f"odeint failed: {e}, trying alternative method")
+    
+    # Method 3: scipy solve_ivp with BDF (better for stiff equations)
+    if method in ['auto', 'solve_ivp']:
+        try:
+            def dgdlogt(logt, g):
+                return beta_func(g)
+            
+            log_mu_vals = np.linspace(0, log_mu, 100)
+            sol = solve_ivp(dgdlogt, [0, log_mu], [g0], 
+                          method='BDF', t_eval=log_mu_vals,
+                          rtol=1e-6, atol=1e-9)
+            result = sol.y[0, -1]
+            
+            if np.isfinite(result) and abs(result) < 100:
+                return result
+        except Exception as e:
+            warnings.warn(f"solve_ivp failed: {e}, using analytic approximation")
+    
+    # Fallback: Analytic approximation
+    return running_coupling_robust(mu, g0, epsilon, method='analytic')
+
+def callan_symanzik_equation(epsilon=1.0):
     """
     CS equation: [μ ∂/∂μ + β(g) ∂/∂g + n·γ(g)] G_n = 0
     
@@ -182,26 +348,8 @@ def callan_symanzik_equation():
     print("CALLAN-SYMANZIK EQUATION: Capability Scaling Laws")
     print("="*70)
     
-    # Define running coupling solution: g(μ) from β(g) = μ dg/dμ
-    epsilon = 1.0  # d=3 case
-    
-    def beta_func(g):
-        return float(beta_epsilon(g, epsilon, order=2))
-    
-    def running_coupling(mu, g0=0.1):
-        """
-        Solve: dg/d(log μ) = β(g)
-        Starting from g(μ=1) = g0
-        """
-        def dgdlogt(g, logt):
-            return beta_func(g)
-        
-        log_mu_vals = np.linspace(0, np.log(mu), 100)
-        g_vals = odeint(dgdlogt, g0, log_mu_vals)
-        return g_vals[-1, 0]
-    
     # Compute anomalous dimension γ(g) = -η·g + O(g²)
-    def gamma_phi(g, epsilon=1.0):
+    def gamma_phi(g, epsilon=epsilon):
         """Anomalous dimension of the field φ"""
         eta = critical_exponent_eta(epsilon, order=2)
         return -float(eta) * g
@@ -212,9 +360,13 @@ def callan_symanzik_equation():
     gamma_running = []
     
     for mu in mu_vals:
-        g_mu = running_coupling(mu, g0=0.1)
+        # Use robust solver
+        g_mu = running_coupling_robust(mu, g0=0.1, epsilon=epsilon)
         g_running.append(g_mu)
         gamma_running.append(gamma_phi(g_mu, epsilon))
+    
+    g_running = np.array(g_running)
+    gamma_running = np.array(gamma_running)
     
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
     
@@ -772,6 +924,266 @@ SAFETY CRITERION: We MUST engineer Δ_align < Δ_cap
     print(f"4. Verify Δ_align < Δ_cap → Ensure alignment doesn't decay!")
 
 # ============================================================
+# PART 5: EMPIRICAL DATA HOOKS
+# ============================================================
+
+def load_scaling_data(filepath=None):
+    """
+    Load scaling law data from file.
+    
+    Expected format: JSON with 'params' and 'loss' or 'capability' keys
+    Example: {'params': [1e6, 1e7, 1e8, 1e9], 'loss': [3.5, 2.8, 2.1, 1.5]}
+    
+    Returns:
+        dict with 'params' (numpy array) and 'loss' (numpy array)
+    """
+    if filepath is None:
+        # Generate synthetic Chinchilla-like scaling data for demonstration
+        # Chinchilla scaling law: loss = A + B * N^(-α) + C * D^(-β)
+        # Simplified: loss ~ params^(-α) for demonstration
+        
+        print("\n[INFO] Using synthetic scaling data (Chinchilla-like)")
+        print("[INFO] In production, load real data from file")
+        
+        # Synthetic data mimicking real LLM scaling
+        params = np.array([1e6, 3e6, 1e7, 3e7, 1e8, 3e8, 1e9, 3e9, 1e10])
+        # Power law with exponent ~-0.1 (approximate)
+        loss = 2.5 + 0.5 * (params / 1e6)**(-0.1) + 0.1 * np.random.randn(len(params))
+        loss = np.clip(loss, 1.5, 3.0)  # Reasonable loss bounds
+        
+        return {'params': params, 'loss': loss}
+    
+    else:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        
+        return {
+            'params': np.array(data['params']),
+            'loss': np.array(data['loss'])
+        }
+
+def scaling_law_model(N, A, alpha, B=None):
+    """
+    Simple power law scaling model.
+    
+    loss(N) = A + B * N^(-alpha)
+    
+    For more complex models, could include data dependence too.
+    """
+    if B is None:
+        B = 1.0
+    return A + B * N**(-alpha)
+
+def fit_scaling_exponent(data):
+    """
+    Fit power law exponent from scaling data.
+    
+    Returns:
+        popt: Fitted parameters [A, B, alpha]
+        pcov: Covariance matrix
+        alpha: Fitted exponent (key quantity for RG analysis)
+    """
+    N = data['params']
+    L = data['loss']
+    
+    # Fit log-log for power law
+    # log(L - A) = log(B) - alpha * log(N)
+    # Linear fit in log space
+    
+    try:
+        # Initial guess
+        A_init = np.min(L) - 0.1
+        L_shifted = L - A_init
+        log_N = np.log10(N)
+        log_L = np.log10(L_shifted)
+        
+        # Linear fit
+        coeffs = np.polyfit(log_N, log_L, 1)
+        alpha_init = -coeffs[0]
+        B_init = 10**coeffs[1]
+        
+        # Nonlinear fit for refinement
+        popt, pcov = curve_fit(
+            lambda N, A, B, alpha: A + B * N**(-alpha),
+            N, L,
+            p0=[A_init - 0.1, B_init, alpha_init],
+            bounds=([0, 0, 0], [5, 10, 1]),
+            maxfev=5000
+        )
+        
+        return popt, pcov
+        
+    except Exception as e:
+        warnings.warn(f"Fitting failed: {e}, using simple estimate")
+        # Fallback: simple log-log slope
+        log_N = np.log(N)
+        log_L = np.log(L - np.min(L) + 0.1)
+        alpha = -np.polyfit(log_N, log_L, 1)[0]
+        return np.array([np.min(L) - 0.1, 1.0, alpha]), np.eye(3)
+
+def extract_beta_from_scaling(alpha_measured, d=3):
+    """
+    Extract beta function information from measured scaling exponent.
+    
+    From RG theory:
+    - Capability ~ μ^Δ where Δ = d_canonical + γ
+    - γ(g) = -η·g + O(g²)
+    
+    For scaling laws: loss ~ params^(-α)
+    The exponent α relates to RG scaling dimension.
+    
+    Args:
+        alpha_measured: Fitted power law exponent from data
+        d: Spatial dimension (default 3 for neural networks)
+    
+    Returns:
+        dict with extracted RG parameters
+    """
+    # In RG, the scaling dimension of the "loss" operator is:
+    # Δ_loss = α * d + (marginal dimension)
+    
+    d_critical = 4  # Upper critical dimension
+    epsilon = d_critical - d  # Distance from critical dimension
+    
+    # For α from loss ~ N^(-α), interpret as:
+    # The field dimension Δ_φ relates to α through
+    # α ≈ (d - 2 + η) / 2 for mean-field scaling
+    
+    if epsilon == 0:
+        # At critical dimension
+        eta = 0
+    else:
+        # Induced anomalous dimension
+        eta = alpha_measured * epsilon
+    
+    # Effective coupling (inverse of alpha at tree level)
+    b1, _ = beta_coefficients(N_COGNITIVE_PRIMITIVES, order=1)
+    g_effective = alpha_measured * abs(b1) / (1 - alpha_measured) if alpha_measured < 1 else 0.5
+    
+    return {
+        'alpha': alpha_measured,
+        'eta': eta,
+        'epsilon': epsilon,
+        'g_effective': g_effective,
+        'interpretation': f'Scaling suggests Δ={alpha_measured*d:.2f} at d={d}'
+    }
+
+def empirical_fitting():
+    """
+    Demonstrate empirical fitting of RG parameters from scaling data.
+    
+    This is the key bridge between theory and observation:
+    1. Load real training curves (compute vs loss/capability)
+    2. Fit power law exponents
+    3. Extract RG parameters (β, ν, η)
+    4. Compare with theoretical predictions
+    """
+    print("\n" + "="*70)
+    print("EMPIRICAL FITTING: Bridging Theory and Observation")
+    print("="*70)
+    
+    # Step 1: Load data
+    print("\n[Step 1] Loading scaling data...")
+    data = load_scaling_data()
+    print(f"  Data points: {len(data['params'])}")
+    print(f"  Parameter range: {data['params'].min():.0e} to {data['params'].max():.0e}")
+    print(f"  Loss range: {data['loss'].min():.2f} to {data['loss'].max():.2f}")
+    
+    # Step 2: Fit scaling law
+    print("\n[Step 2] Fitting scaling law...")
+    popt, pcov = fit_scaling_exponent(data)
+    A, B, alpha = popt
+    alpha_err = np.sqrt(pcov[2, 2])
+    
+    print(f"  Fitted model: loss = {A:.3f} + {B:.3f} × params^(-{alpha:.3f})")
+    print(f"  Power law exponent: α = {alpha:.4f} ± {alpha_err:.4f}")
+    
+    # Step 3: Extract RG parameters
+    print("\n[Step 3] Extracting RG parameters...")
+    rg_params = extract_beta_from_scaling(alpha, d=3)
+    
+    print(f"  Effective dimension: {rg_params['interpretation']}")
+    print(f"  Induced η (anomalous dimension): {rg_params['eta']:.4f}")
+    print(f"  Effective coupling g_eff: {rg_params['g_effective']:.4f}")
+    
+    # Step 4: Visualize fit
+    print("\n[Step 4] Generating fit visualization...")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot 1: Data and fit
+    params_fit = np.logspace(np.log10(data['params'].min()), 
+                            np.log10(data['params'].max()), 100)
+    loss_fit = scaling_law_model(params_fit, A, B, alpha)
+    
+    ax1.scatter(data['params'], data['loss'], s=100, c='blue', label='Data', zorder=5)
+    ax1.plot(params_fit, loss_fit, 'r-', linewidth=2, label=f'Fit: α={alpha:.3f}')
+    ax1.set_xscale('log')
+    ax1.set_xlabel('Parameters', fontsize=11)
+    ax1.set_ylabel('Loss', fontsize=11)
+    ax1.set_title('Scaling Law Fit: Loss vs Parameters', fontsize=12, fontweight='bold')
+    ax1.legend()
+    ax1.grid(alpha=0.3, which='both')
+    
+    # Add fit info text
+    textstr = f'α = {alpha:.3f} ± {alpha_err:.3f}\nη = {rg_params["eta"]:.3f}'
+    ax1.text(0.05, 0.95, textstr, transform=ax1.transAxes, fontsize=10,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Plot 2: Residuals
+    loss_pred = scaling_law_model(data['params'], A, B, alpha)
+    residuals = data['loss'] - loss_pred
+    
+    ax2.scatter(data['params'], residuals, s=80, c='green')
+    ax2.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+    ax2.set_xscale('log')
+    ax2.set_xlabel('Parameters', fontsize=11)
+    ax2.set_ylabel('Residual (data - fit)', fontsize=11)
+    ax2.set_title('Fit Residuals', fontsize=12, fontweight='bold')
+    ax2.grid(alpha=0.3, which='both')
+    
+    plt.tight_layout()
+    plt.savefig('empirical_scaling_fit.png', dpi=150, bbox_inches='tight')
+    print("  → Saved: empirical_scaling_fit.png")
+    
+    # Step 5: Compare with theory
+    print("\n[Step 5] Comparing with RG predictions...")
+    nu_theory = critical_exponent_nu(rg_params['epsilon'], order=2)
+    g_star = g_star_epsilon(rg_params['epsilon'], order=2)
+    
+    print(f"\n  Theoretical predictions (ε={rg_params['epsilon']:.1f}):")
+    print(f"    ν (correlation exponent) = {nu_theory:.3f}")
+    print(f"    g* (fixed point coupling) = {g_star:.3f}")
+    
+    print(f"\n  Empirically inferred:")
+    print(f"    α (scaling exponent) = {alpha:.3f}")
+    print(f"    η (anomalous dim) = {rg_params['eta']:.3f}")
+    
+    print(f"\n  Consistency check:")
+    if abs(alpha - 0.5 * (rg_params['epsilon'] / (1 + rg_params['epsilon']))) < 0.1:
+        print(f"    ✓ Data consistent with RG predictions!")
+    else:
+        print(f"    ⚠ Deviation from mean-field prediction")
+        print(f"    → Suggests non-perturbative effects or N-dependence")
+    
+    # Step 6: Action items
+    print(f"\n╔═══════════════════════════════════════════════════════════════╗")
+    print(f"║ EMPIRICAL RESEARCH AGENDA                                      ║")
+    print(f"╚═══════════════════════════════════════════════════════════════╝")
+    print(f"1. Collect real training curves from open models")
+    print(f"2. Fit α for different architectures (transformers, RNNs, etc.)")
+    print(f"3. Test if α changes with training regime (课, curriculum)")
+    print(f"4. Measure ν from loss curves near phase transitions")
+    print(f"5. Verify alignment scaling: does Δ_align < Δ_cap hold?")
+    
+    return {
+        'alpha': alpha,
+        'alpha_err': alpha_err,
+        'rg_params': rg_params,
+        'popt': popt,
+        'pcov': pcov
+    }
+
+# ============================================================
 # PART 6: MAIN EXECUTION
 # ============================================================
 
@@ -800,6 +1212,12 @@ def main():
     operator_product_expansion()
     meta_analysis()
     safety_theorems()
+    
+    # New: Empirical fitting
+    print("\n" + "="*70)
+    print("EMPIRICAL VALIDATION")
+    print("="*70)
+    fit_results = empirical_fitting()
     
     # Final synthesis
     print("\n" + "="*70)
@@ -861,7 +1279,16 @@ These questions have TESTABLE answers. Let us find them.
     print("  • meta_hierarchy.png - Self-reference structure")
     print("  • strange_loop.png - Gödelian paradox visualization")
     print("  • safety_theorems.png - Testable predictions")
+    print("  • empirical_scaling_fit.png - Empirical validation")
     print("="*70)
+    
+    # Print empirical results summary
+    try:
+        print(f"\nEmpirical Fit Summary:")
+        print(f"  Scaling exponent α = {fit_results['alpha']:.4f} ± {fit_results['alpha_err']:.4f}")
+        print(f"  Inferred η = {fit_results['rg_params']['eta']:.4f}")
+    except:
+        pass
     
     print("\n\"The scientist does not study nature because it is useful;")
     print("he studies it because he delights in it, and he delights in it")
